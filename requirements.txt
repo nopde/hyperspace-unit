@@ -1,3 +1,1 @@
-# This project currently has no external dependencies.
-# All required modules (json, os, struct, zlib, io, time, datetime, typing)
-# are part of the Python standard library (tested with Python 3.7+).
+cryptography>=3.4
