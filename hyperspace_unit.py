@@ -447,7 +447,7 @@ class HyperspaceUnit:
         if actual_compress_algo == "zlib":
             compressor = zlib.compressobj(level=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
         elif actual_compress_algo == "bz2":
-            compressor = bz2.BZ2Compressor(compresslevel=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+            compressor = bz2.BZ2Compressor(DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
         elif actual_compress_algo == "lzma":
             # Use LZMACompressor for streaming
             compressor = lzma.LZMACompressor(format=lzma.FORMAT_XZ, preset=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
