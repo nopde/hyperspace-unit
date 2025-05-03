@@ -30,7 +30,7 @@ A Python module for creating, reading, and managing custom container files calle
 Currently, you can use this module by cloning the repository or downloading the `hyperspace_unit.py` file and placing it in your Python project directory or a location in your `PYTHONPATH`.
 
 ```bash
-git clone [https://github.com/nopde/hyperspace-unit.git](https://github.com/nopde/hyperspace-unit.git)
+git clone https://github.com/nopde/hyperspace-unit.git
 cd hyperspace
 ```
 
