@@ -31,7 +31,7 @@ Currently, you can use this module by cloning the repository or downloading the 
 
 ```bash
 git clone https://github.com/nopde/hyperspace-unit.git
-cd hyperspace
+cd hyperspace-unit
 ```
 
 ### Contributing
