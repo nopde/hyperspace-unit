@@ -10,36 +10,21 @@ algorithms, custom metadata, explicit directories, and entry updates.
 
 The Hyperspace Unit (.hsu) file format is structured as follows:
 1.  Header (Fixed Size):
-    - Magic Number (8 bytes): b'HSPACEU2'
-    - Format Version (2 bytes, uint16): e.g., 2
-    - Reserved (6 bytes): Set to zero for future use.
+    - Magic Number (8 bytes): b'HSPACEU1'
+    - Format Version (2 bytes, uint16): 1
+    - Flags (2 bytes, uint16): Reserved for future use (e.g., indicates presence of metadata). Currently 0.
+    - Reserved (4 bytes): Set to zero.
+    - Metadata Offset (8 bytes, uint64): Byte offset where metadata block starts (0 if none).
+    - Metadata Size (8 bytes, uint64): Size of compressed metadata block (0 if none).
     - Index Offset (8 bytes, uint64): Byte offset where the index starts.
     - Index Size (8 bytes, uint64): Size of the compressed index in bytes.
-2.  Data Blocks: Contiguous blocks containing the actual (potentially encrypted
-    and/or compressed) data of the archived entries.
-3.  Index (Variable Size, Compressed): A zlib-compressed JSON object located at
-    the end of the file (position specified by Index Offset). This JSON object
-    maps archived entry names to their metadata:
-    {
-        "entry_name": {
-            "entry_type": str,      # "file" or "directory"
-            "offset": int,          # Byte offset for file data (0 for directory)
-            "orig_size": int,       # Original size (0 for directory)
-            "stored_size": int,     # Size as stored (encrypted/compressed) (0 for directory)
-            "crc32": int,           # CRC32 of original uncompressed, unencrypted data (0 for directory)
-            "compression": str,     # "none", "zlib", "bz2", "lzma"
-            "timestamp": float,     # Modification timestamp (UTC epoch)
-            "metadata": dict,       # User-defined custom metadata
-            "encryption": {         # Optional: Only present if encrypted
-                "algo": str,        # e.g., "aes-gcm-256"
-                "salt": str,        # Salt for key derivation (hex encoded)
-                "nonce": str,       # Nonce/IV for encryption (hex encoded)
-                "tag": str          # Authentication tag for GCM (hex encoded)
-            },
-            "deleted": bool         # Flag for lazy deletion
-        },
-        ...
-    }
+    - Index CRC32 (4 bytes, uint32): CRC32 checksum of the *compressed* index block.
+2.  Data Blocks: Contiguous blocks for archived entries.
+3.  Metadata Block (Optional, Variable Size, Compressed): Optional zlib-compressed
+    JSON object containing archive-level metadata. Located at Metadata Offset.
+4.  Index (Variable Size, Compressed): A zlib-compressed JSON object located at
+    the end of the file (position specified by Index Offset). Structure remains
+    the same as version 1.
 
 Requires:
     - Python 3.7+
@@ -55,7 +40,7 @@ import lzma
 import io
 import time
 import secrets  # For generating salt and nonce
-from typing import Dict, Any, Optional, List, BinaryIO, Literal, Iterator
+from typing import Dict, Any, Optional, List, BinaryIO, Literal, Iterator, Callable, Tuple
 
 # --- Cryptography Requirements ---
 try:
@@ -73,8 +58,9 @@ except ImportError:
 # --- Constants ---
 MAGIC_NUMBER = b"HSPACEU1"
 FORMAT_VERSION = 1
-# Header: Magic(8s), FormatVersion(H=uint16), Reserved(6x), IndexOffset(Q), IndexSize(Q)
-HEADER_FORMAT = ">8sH6xQQ"
+# Header: Magic(8s), FormatVersion(H=u16), Flags(H=u16), Reserved(4x),
+#         MetaOffset(Q), MetaSize(Q), IndexOffset(Q), IndexSize(Q), IndexCRC32(I=u32)
+HEADER_FORMAT = ">8sHH4xQQQQI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 DEFAULT_COMPRESSION_ALGO = "zlib"
@@ -98,6 +84,9 @@ CHUNK_SIZE = 64 * 1024  # 64KB for streaming operations
 # Entry Types
 ENTRY_TYPE_FILE = "file"
 ENTRY_TYPE_DIRECTORY = "directory"
+
+# Flag bits (not used yet)
+FLAG_HAS_METADATA = 1 << 0
 
 
 # --- Custom Exceptions ---
@@ -152,38 +141,6 @@ def _derive_key(password: bytes, salt: bytes) -> bytes:
     return kdf.derive(password)
 
 
-def _compress_chunk(data: bytes, algo: str) -> bytes:
-    """Compresses a chunk of data using the specified algorithm."""
-    if algo == "zlib":
-        compressor = zlib.compressobj(level=DEFAULT_COMPRESSION_LEVEL[algo])
-        return compressor.compress(data) + compressor.flush()
-    elif algo == "bz2":
-        compressor = bz2.BZ2Compressor(DEFAULT_COMPRESSION_LEVEL[algo])
-        return compressor.compress(data) + compressor.flush()
-    elif algo == "lzma":
-        # LZMA chunking requires more complex filter setup for streaming.
-        return lzma.compress(data, format=lzma.FORMAT_XZ, preset=DEFAULT_COMPRESSION_LEVEL[algo])
-    elif algo == "none":
-        return data
-    else:
-        raise ValueError(f"Unsupported compression algorithm: {algo}")
-
-
-def _decompress_chunk(data: bytes, algo: str) -> bytes:
-    """Decompresses a chunk of data using the specified algorithm."""
-    # Assumes 'data' is a complete block for the entry. Streaming needs stateful decompressors.
-    if algo == "zlib":
-        return zlib.decompress(data)
-    elif algo == "bz2":
-        return bz2.decompress(data)
-    elif algo == "lzma":
-        return lzma.decompress(data, format=lzma.FORMAT_XZ)
-    elif algo == "none":
-        return data
-    else:
-        raise ValueError(f"Unsupported compression algorithm: {algo}")
-
-
 # --- Main Class ---
 class HyperspaceUnit:
     """
@@ -197,9 +154,11 @@ class HyperspaceUnit:
         self.filename: str = filename
         self._file: Optional[BinaryIO] = None
         self._index: Dict[str, Dict[str, Any]] = {}
+        self._archive_metadata: Dict[str, Any] = {}
         self._open_mode: Optional[Literal["r", "w", "a", "r+"]] = None
         self._modified: bool = False
         self._format_version: int = 0  # Read from header
+        self._flags: int = 0  # Read from header
 
     def open(self, mode: Literal["r", "w", "a", "r+"] = "r") -> "HyperspaceUnit":
         """Opens the Hyperspace Unit file."""
@@ -214,25 +173,29 @@ class HyperspaceUnit:
 
         self._open_mode = mode
         self._index = {}
+        self._archive_metadata = {}
         self._modified = False
         self._format_version = 0
+        self._flags = 0
         file_exists = os.path.exists(self.filename)
 
         try:
             if mode == "w":
                 self._file = open(self.filename, "wb")
-                self._write_header(0, 0)  # Write empty header
+                self._write_header(metadata_offset=0, metadata_size=0, index_offset=0, index_size=0, index_crc32=0, flags=0)  # Write empty header
                 self._file.close()
                 self._file = open(self.filename, "r+b")
                 self._open_mode = "r+"
-                self._format_version = FORMAT_VERSION  # New file is current version
+                self._format_version = FORMAT_VERSION
+                self._flags = 0
             elif mode == "a":
                 self._file = open(self.filename, "r+b" if file_exists else "w+b")
                 if file_exists:
                     self._read_index()  # Reads header too
                 else:
-                    self._write_header(0, 0)
+                    self._write_header(metadata_offset=0, metadata_size=0, index_offset=0, index_size=0, index_crc32=0, flags=0)
                     self._format_version = FORMAT_VERSION
+                    self._flags = 0
                 self._open_mode = "r+"
             elif mode == "r":
                 if not file_exists:
@@ -259,7 +222,7 @@ class HyperspaceUnit:
         if self._file and not self._file.closed:
             if self._modified and ("w" in self._open_mode or "+" in self._open_mode):
                 try:
-                    self._write_index()
+                    self._write_metadata_and_index()
                 except Exception as e:
                     print(f'Warning: Failed to write index on close for "{self.filename}": {e}')
             try:
@@ -269,9 +232,11 @@ class HyperspaceUnit:
             finally:
                 self._file = None
                 self._index = {}
+                self._archive_metadata = {}
                 self._open_mode = None
                 self._modified = False
                 self._format_version = 0
+                self._flags = 0
 
     def __enter__(self) -> "HyperspaceUnit":
         """Enter the runtime context."""
@@ -287,46 +252,200 @@ class HyperspaceUnit:
         self.close()
 
     # --- Internal Header/Index Handling ---
-
-    def _read_header(self) -> tuple[int, int]:
+    def _read_header(self) -> tuple[int, int, int, int, int, int]:
         """Reads and validates the header."""
-        if not self._file or self._file.closed:
-            raise HyperspaceUnitError("File is not open for reading header.")
         self._file.seek(0)
         header_data = self._file.read(HEADER_SIZE)
         if len(header_data) < HEADER_SIZE:
             raise InvalidFormatError("File is too small to be a valid Hyperspace Unit.")
 
         try:
-            magic, version, index_offset, index_size = struct.unpack(HEADER_FORMAT, header_data)
+            magic, version, flags, meta_offset, meta_size, idx_offset, idx_size, idx_crc32 = struct.unpack(HEADER_FORMAT, header_data)
         except struct.error as e:
             raise InvalidFormatError(f"Invalid header structure: {e}") from e
+
+        return flags, meta_offset, meta_size, idx_offset, idx_size, idx_crc32
+
+    def _read_metadata_and_index(self):
+        """Reads the metadata and index from the file."""
+        if not self._file or self._file.closed:
+            raise HyperspaceUnitError("File is not open for reading metadata and index.")
+
+        self._archive_metadata = {}
+        self._index = {}
+
+        self._file.seek(0)
+        initial_bytes = self._file.read(10)
+        if len(initial_bytes) < 10:
+            raise InvalidFormatError("File too small to determine version.")
+
+        try:
+            magic, version = struct.unpack(">8sH", initial_bytes)
+        except struct.error as e:
+            raise InvalidFormatError(f"Could not read magic number and version: {e}") from e
 
         if magic != MAGIC_NUMBER:
             raise InvalidFormatError("File is not a Hyperspace Unit (invalid magic number).")
 
         if version > FORMAT_VERSION:
             raise InvalidFormatError(f"Unsupported Hyperspace Unit format version: {version}. This module supports up to version {FORMAT_VERSION}.")
-        # Backward compatibility check (optional)
-        # if version < FORMAT_VERSION:
-        #      print(f"Warning: Opening older Hyperspace Unit format version: {version}.")
+
+        flags, metadata_offset, metadata_size, index_offset, index_size, index_crc32 = self._read_header()
 
         self._format_version = version
-        return index_offset, index_size
+        self._flags = flags
 
-    def _write_header(self, index_offset: int, index_size: int):
+        if metadata_offset > 0 and metadata_size > 0:
+            try:
+                self._file.seek(metadata_offset)
+                compressed_metadata = self._file.read(metadata_size)
+                if len(compressed_metadata) != metadata_size:
+                    raise InvalidFormatError(f"Could not read the full metadata block (expected {metadata_size} bytes, got {len(compressed_metadata)}).")
+                metadata_json = zlib.decompress(compressed_metadata)
+                self._archive_metadata = json.loads(metadata_json.decode("utf-8"))
+            except (zlib.error, json.JSONDecodeError) as e:
+                raise InvalidFormatError(f"Failed to read or parse the metadata block: {e}") from e
+            except (IOError, OSError) as e:
+                raise HyperspaceUnitError(f"I/O error while reading metadata block: {e}") from e
+
+        if index_offset == 0 or index_size == 0:
+            self._index = {}
+            self._modified = False
+            return
+
+        try:
+            self._file.seek(0, os.SEEK_END)
+            file_size = self._file.tell()
+            min_offset = HEADER_SIZE
+
+            if metadata_offset > 0 and metadata_size > 0:
+                min_offset = max(min_offset, metadata_offset + metadata_size)
+
+            if index_offset < min_offset or (index_offset + index_size) > file_size:
+                raise InvalidFormatError(f"Invalid index position/size (Offset: {index_offset}, Size: {index_size}, MetaEnd: {metadata_offset + metadata_size}, FileSize: {file_size}).")
+
+            self._file.seek(index_offset)
+            compressed_index = self._file.read(index_size)
+            if len(compressed_index) != index_size:
+                raise InvalidFormatError(f"Could not read the full index (expected {index_size} bytes, got {len(compressed_index)}).")
+
+            if self._format_version >= 1:
+                calculated_index_crc = zlib.crc32(compressed_index) & 0xFFFFFFFF
+                if calculated_index_crc != index_crc32:
+                    raise InvalidFormatError(f"Index CRC32 mismatch (expected {index_crc32}, got {calculated_index_crc}).")
+
+            index_json = zlib.decompress(compressed_index)
+            self._index = json.loads(index_json.decode("utf-8"))
+
+            self._index = {name: meta for name, meta in self._index.items() if not meta.get("deleted", False)}
+            self._modified = False
+        except (struct.error, zlib.error, json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise InvalidFormatError(f"Failed to read or parse the index: {e}") from e
+        except ChecksumError:
+            raise
+        except InvalidFormatError:
+            raise
+        except (IOError, OSError) as e:
+            raise HyperspaceUnitError(f"I/O error while reading index: {e}") from e
+
+    def _write_header(self, metadata_offset: int, metadata_size: int, index_offset: int, index_size: int, index_crc32: int, flags: int):
         """Writes the header."""
         if not self._file or self._file.closed or "w" not in self._open_mode and "+" not in self._open_mode:
             raise HyperspaceUnitError("File is not open for writing header.")
         self._file.seek(0)
-        header_data = struct.pack(HEADER_FORMAT, MAGIC_NUMBER, FORMAT_VERSION, index_offset, index_size)
+        header_data = struct.pack(HEADER_FORMAT, MAGIC_NUMBER, FORMAT_VERSION, flags, metadata_offset, metadata_size, index_offset, index_size, index_crc32)
         self._file.write(header_data)
-        self._file.flush()
+
+    def _write_metadata_and_index(self):
+        """Serializes, compresses, and writes the metadata and index."""
+        if not self._file or self._file.closed or "w" not in self._open_mode and "+" not in self._open_mode:
+            raise HyperspaceUnitError("File is not open for writing metadata and index.")
+
+        end_of_last_data_block = HEADER_SIZE
+        active_entries = [meta for meta in self._index.values() if not meta.get("deleted", False)]
+        if active_entries:
+            file_entries = [e for e in active_entries if e.get("entry_type") == ENTRY_TYPE_FILE]
+            if file_entries:
+                end_of_last_data_block = max([HEADER_SIZE] + [entry["offset"] + entry["stored_size"] for entry in file_entries])
+
+        try:
+            self._file.seek(end_of_last_data_block)
+            self._file.truncate()
+        except (IOError, OSError) as e:
+            raise HyperspaceUnitError(f"Failed to truncate file before writing metadata and index: {e}") from e
+
+        current_pos = self._file.tell()
+        flags = self._flags
+
+        metadata_offset = 0
+        metadata_size = 0
+
+        if self._archive_metadata:
+            try:
+                metadata_json = json.dumps(self._archive_metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                compressed_metadata = zlib.compress(metadata_json, level=DEFAULT_COMPRESSION_LEVEL["zlib"])
+                metadata_offset = current_pos
+                metadata_size = len(compressed_metadata)
+                self._file.write(compressed_metadata)
+                current_pos += metadata_size
+            except (TypeError, zlib.error, json.JSONDecodeError) as e:
+                raise HyperspaceUnitError(f"Failed to serialize or compress the metadata block: {e}") from e
+            except (IOError, OSError) as e:
+                raise HyperspaceUnitError(f"I/O error while writing metadata block: {e}") from e
+
+        index_offset = 0
+        index_size = 0
+        index_crc32 = 0
+        index_to_write = {name: meta for name, meta in self._index.items() if not meta.get("deleted", False)}
+
+        if index_to_write:
+            try:
+                index_json = json.dumps(index_to_write, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                compressed_index = zlib.compress(index_json, level=DEFAULT_COMPRESSION_LEVEL["zlib"])
+                index_offset = current_pos
+                index_size = len(compressed_index)
+                index_crc32 = zlib.crc32(compressed_index) & 0xFFFFFFFF
+                self._file.write(compressed_index)
+            except (TypeError, zlib.error, json.JSONDecodeError) as e:
+                raise HyperspaceUnitError(f"Failed to serialize or compress the index: {e}") from e
+            except (IOError, OSError) as e:
+                raise HyperspaceUnitError(f"I/O error while writing index: {e}") from e
+
+        try:
+            self._write_header(metadata_offset, metadata_size, index_offset, index_size, index_crc32, flags)
+            self._file.flush()
+            self._modified = False
+        except (IOError, OSError) as e:
+            raise HyperspaceUnitError(f"I/O error while writing header: {e}") from e
+
+    def set_archive_metadata(self, data: Dict[str, Any]):
+        """
+        Sets the archive-level metadata. Overwrites any existing metadata.
+        The metadata will be written when the file is closed or flushed.
+        """
+        if not self._file or self._file.closed or "w" not in self._open_mode and "+" not in self._open_mode:
+            raise HyperspaceUnitError("File is not open for writing metadata.")
+        if not isinstance(data, dict):
+            raise TypeError("Metadata must be a dictionary.")
+        self._archive_metadata = data.copy()
+        self._modified = True
+
+    def get_archive_metadata(self) -> Dict[str, Any]:
+        """Returns a copy of the archive-level metadata."""
+        if not self._file or self._file.closed:
+            try:
+                with HyperspaceUnit(self.filename) as temp_unit:
+                    temp_unit.open("r")
+                    return temp_unit.get_archive_metadata()
+            except (FileNotFoundError, InvalidFormatError, HyperspaceUnitError) as e:
+                print(f"Warning: Could not reopen file to read metadata: {e}")
+                return {}
+        return self._archive_metadata.copy()
 
     def _read_index(self):
         """Reads, decompresses, and parses the index from the file."""
         try:
-            index_offset, index_size = self._read_header()
+            _, _, _, index_offset, index_size, _ = self._read_header()
 
             if index_offset == 0 or index_size == 0:
                 self._index = {}
@@ -404,14 +523,14 @@ class HyperspaceUnit:
         self,
         entry_name: str,
         entry_type: str,
-        data_iterator: Iterator[bytes],  # Use an iterator for streaming
+        data_provider: Callable[[], Iterator[bytes]],
         original_size: int,
         compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
         timestamp: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         password: Optional[str] = None,
+        allow_ineffective_compression: bool = True,
     ):
-        """Internal helper to add file or stream data."""
         if not self._file or self._file.closed or "w" not in self._open_mode and "+" not in self._open_mode:
             raise HyperspaceUnitError('Unit must be open in a writable mode ("w", "a", "r+") to add data.')
         if not entry_name:
@@ -426,33 +545,28 @@ class HyperspaceUnit:
         timestamp = timestamp if timestamp is not None else time.time()
 
         if entry_type == ENTRY_TYPE_DIRECTORY:
-            # Directories have no data content
             self._index[entry_name] = {"entry_type": ENTRY_TYPE_DIRECTORY, "offset": 0, "orig_size": 0, "stored_size": 0, "crc32": 0, "compression": "none", "timestamp": timestamp, "metadata": metadata, "deleted": False}
             self._modified = True
             return
 
-        # --- File Data Handling ---
-        crc_calculator = zlib.crc32(b"")  # Initialize CRC calculator
-        stored_size = 0
+        crc_calculator = zlib.crc32(b"")
+        stored_size_calculated = 0
         encryption_info = None
         derived_key = None
         encryptor = None
         salt = None
         nonce = None
-
-        # --- Compression Setup ---
-        actual_compress_algo = compress_algo if compress_algo is not None else "none"
         compressor = None
-        # Initialize stateful compressors if needed
+        actual_compress_algo = compress_algo if compress_algo is not None else "none"
+        processed_data_buffer = io.BytesIO()
+
         if actual_compress_algo == "zlib":
             compressor = zlib.compressobj(level=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
         elif actual_compress_algo == "bz2":
             compressor = bz2.BZ2Compressor(DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
         elif actual_compress_algo == "lzma":
-            # Use LZMACompressor for streaming
             compressor = lzma.LZMACompressor(format=lzma.FORMAT_XZ, preset=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
 
-        # --- Encryption Setup ---
         if password:
             if not CRYPTOGRAPHY_AVAILABLE:
                 raise FeatureNotAvailableError("Cryptography library required for encryption.")
@@ -465,94 +579,38 @@ class HyperspaceUnit:
                 "algo": ENCRYPTION_ALGO,
                 "salt": salt.hex(),
                 "nonce": nonce.hex(),
-                # Tag will be added after processing all data
             }
 
-        # --- Determine write position ---
         end_of_last_data_block = HEADER_SIZE
         active_entries = [meta for meta in self._index.values() if not meta.get("deleted", False)]
         file_entries = [e for e in active_entries if e.get("entry_type") == ENTRY_TYPE_FILE]
         if file_entries:
             end_of_last_data_block = max([HEADER_SIZE] + [entry["offset"] + entry["stored_size"] for entry in file_entries])
 
-        try:
-            self._file.seek(end_of_last_data_block)
-            offset = self._file.tell()
+        offset = 0
 
-            # --- Process Data Stream ---
-            final_stored_size = 0
-            first_chunk_processed_for_ratio = False  # Flag to check ratio only once
+        try:
+            data_iterator = data_provider()
 
             for chunk in data_iterator:
                 if not isinstance(chunk, bytes):
                     raise TypeError("Data iterator must yield bytes.")
 
-                # 1. Calculate CRC on original data
                 crc_calculator = zlib.crc32(chunk, crc_calculator)
 
-                # 2. Compress (using stateful compressor if applicable)
                 if compressor:
                     compressed_chunk = compressor.compress(chunk)
-                else:  # compression is "none"
+                else:
                     compressed_chunk = chunk
 
-                # Check compression ratio on the first chunk's output
-                if not first_chunk_processed_for_ratio and actual_compress_algo != "none":
-                    if len(compressed_chunk) >= len(chunk):
-                        # Compression ineffective, switch to "none" for the rest
-                        print(f"    Info: Compression '{actual_compress_algo}' ineffective for first chunk of '{entry_name}'. Reverting to uncompressed.")
-                        actual_compress_algo = "none"
-                        # We need to reprocess the *original* first chunk without compression
-                        # This requires buffering or restarting the iterator, which complicates things.
-                        # Simplification: We'll stick with the chosen compression for now,
-                        # even if the first chunk wasn't ideal. A better implementation
-                        # might buffer the first chunk's compressed output and only write
-                        # after deciding the final method.
-                        # OR: Decide based on overall ratio after processing all? Also complex.
-                        # Let's remove the auto-switch for simplicity for now.
-                        pass  # Keep original compression choice for now
-                    first_chunk_processed_for_ratio = True
-
-                # 3. Encrypt (if password provided)
                 if encryptor:
                     encrypted_chunk = encryptor.update(compressed_chunk)
                 else:
                     encrypted_chunk = compressed_chunk
 
-                # 4. Write to file
-                if encrypted_chunk:  # Write only if there's output
-                    self._file.write(encrypted_chunk)
-                    final_stored_size += len(encrypted_chunk)
+                if encrypted_chunk:
+                    processed_data_buffer.write(encrypted_chunk)
 
-            # --- Finalize Compression ---
-            if compressor:
-                final_compressed_chunk = compressor.flush()  # Get remaining compressed data
-                if final_compressed_chunk:
-                    # Encrypt final compressed chunk
-                    if encryptor:
-                        encrypted_chunk = encryptor.update(final_compressed_chunk)
-                    else:
-                        encrypted_chunk = final_compressed_chunk
-
-                    # Write final compressed chunk
-                    if encrypted_chunk:
-                        self._file.write(encrypted_chunk)
-                        final_stored_size += len(encrypted_chunk)
-
-            # --- Finalize Encryption (get the tag) ---
-            if encryptor:
-                final_encrypted_chunk = encryptor.finalize()  # Final block + tag calculation
-                self._file.write(final_encrypted_chunk)
-                final_stored_size += len(final_encrypted_chunk)
-                if encryption_info:
-                    encryption_info["tag"] = encryptor.tag.hex()
-
-            self._file.flush()  # Ensure all data is written
-
-        except (IOError, OSError) as e:
-            raise HyperspaceUnitError(f'I/O error while writing data for "{entry_name}": {e}') from e
-        except StopIteration:
-            # Handle case where iterator was empty initially - need to flush/finalize compressors/encryptors too
             if compressor:
                 final_compressed_chunk = compressor.flush()
                 if final_compressed_chunk:
@@ -561,26 +619,85 @@ class HyperspaceUnit:
                     else:
                         encrypted_chunk = final_compressed_chunk
                     if encrypted_chunk:
-                        self._file.write(encrypted_chunk)
-                        final_stored_size += len(encrypted_chunk)
+                        processed_data_buffer.write(encrypted_chunk)
+
             if encryptor:
                 final_encrypted_chunk = encryptor.finalize()
-                self._file.write(final_encrypted_chunk)
-                final_stored_size += len(final_encrypted_chunk)
+                processed_data_buffer.write(final_encrypted_chunk)
                 if encryption_info:
                     encryption_info["tag"] = encryptor.tag.hex()
-            self._file.flush()
-        except Exception as e:
-            raise HyperspaceUnitError(f'Error processing data for "{entry_name}": {e}') from e
 
-        # --- Update Index ---
+            stored_size_calculated = processed_data_buffer.tell()
+            final_compress_algo = actual_compress_algo
+
+            if actual_compress_algo != "none" and stored_size_calculated >= original_size:
+                if not allow_ineffective_compression:
+                    raise HyperspaceUnitError(f"Compression '{actual_compress_algo}' resulted in larger or equal size ({stored_size_calculated} >= {original_size}) and ineffective compression is disallowed.")
+                else:
+                    print(f"      Warning: Compression '{actual_compress_algo}' for '{entry_name}' resulted in larger/equal size ({stored_size_calculated} >= {original_size}). Storing compressed data.")
+                    pass
+
+            self._file.seek(end_of_last_data_block)
+            offset = self._file.tell()
+            processed_data_buffer.seek(0)
+            buffer_chunk_size = CHUNK_SIZE
+            while True:
+                chunk_to_write = processed_data_buffer.read(buffer_chunk_size)
+                if not chunk_to_write:
+                    break
+                self._file.write(chunk_to_write)
+
+            self._file.flush()
+
+        except StopIteration:
+            try:
+                if compressor:
+                    final_compressed_chunk = compressor.flush()
+                    if final_compressed_chunk:
+                        if encryptor:
+                            encrypted_chunk = encryptor.update(final_compressed_chunk)
+                        else:
+                            encrypted_chunk = final_compressed_chunk
+                        if encrypted_chunk:
+                            processed_data_buffer.write(encrypted_chunk)
+                if encryptor:
+                    final_encrypted_chunk = encryptor.finalize()
+                    processed_data_buffer.write(final_encrypted_chunk)
+                    if encryption_info:
+                        encryption_info["tag"] = encryptor.tag.hex()
+
+                stored_size_calculated = processed_data_buffer.tell()
+                final_compress_algo = actual_compress_algo
+
+                self._file.seek(end_of_last_data_block)
+                offset = self._file.tell()
+                processed_data_buffer.seek(0)
+                buffer_chunk_size = CHUNK_SIZE
+                while True:
+                    chunk_to_write = processed_data_buffer.read(buffer_chunk_size)
+                    if not chunk_to_write:
+                        break
+                    self._file.write(chunk_to_write)
+                self._file.flush()
+
+                if original_size != 0:
+                    print(f"Warning: Data provider for '{entry_name}' was empty, but original_size was {original_size}.")
+
+            except Exception as e_stop:
+                raise HyperspaceUnitError(f'Error during finalization after empty data stream for "{entry_name}": {e_stop}') from e_stop
+
+        except (IOError, OSError, TypeError, ValueError) as e:
+            raise HyperspaceUnitError(f'Error processing or writing data for "{entry_name}": {e}') from e
+        finally:
+            processed_data_buffer.close()
+
         self._index[entry_name] = {
             "entry_type": ENTRY_TYPE_FILE,
             "offset": offset,
             "orig_size": original_size,
-            "stored_size": final_stored_size,
-            "crc32": crc_calculator & 0xFFFFFFFF,  # Store as unsigned int
-            "compression": actual_compress_algo,  # Use the final decided algorithm (removed auto-switch for now)
+            "stored_size": stored_size_calculated,
+            "crc32": crc_calculator & 0xFFFFFFFF,
+            "compression": final_compress_algo,
             "timestamp": timestamp,
             "metadata": metadata,
             "deleted": False,
@@ -590,14 +707,17 @@ class HyperspaceUnit:
 
         self._modified = True
 
-    def add_data(self, entry_name: str, data: bytes, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None):
+    def add_data(self, entry_name: str, data: bytes, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_ineffective_compression: bool = True):
         """Adds raw byte data as a file entry."""
         if not isinstance(data, bytes):
             raise TypeError("Data must be bytes.")
-        data_iterator = iter([data])
-        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, data_iterator, len(data), compress_algo, timestamp, metadata, password)
 
-    def add_file(self, file_path: str, entry_name: Optional[str] = None, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None):
+        def provider():
+            yield data
+
+        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, len(data), compress_algo, timestamp, metadata, password, allow_ineffective_compression)
+
+    def add_file(self, file_path: str, entry_name: Optional[str] = None, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_ineffective_compression: bool = True):
         """Adds a file from the local filesystem."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f'Local file not found: "{file_path}"')
@@ -612,36 +732,43 @@ class HyperspaceUnit:
             timestamp = os.path.getmtime(file_path)
             original_size = os.path.getsize(file_path)
 
-            def file_iterator():
-                with open(file_path, "rb") as f_in:
-                    while True:
-                        chunk = f_in.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        yield chunk
+            def provider():
+                try:
+                    with open(file_path, "rb") as f_in:
+                        while True:
+                            chunk = f_in.read(CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            yield chunk
+                except (IOError, OSError) as e_prov:
+                    raise HyperspaceUnitError(f'Failed to read local file "{file_path}": {e_prov}') from e_prov
 
-            self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, file_iterator(), original_size, compress_algo, timestamp, metadata, password)
+            self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, timestamp, metadata, password, allow_ineffective_compression)
         except (IOError, OSError) as e:
             raise HyperspaceUnitError(f'Failed to read local file "{file_path}": {e}') from e
 
-    def add_stream(self, entry_name: str, stream: BinaryIO, original_size: int, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None):
+    def add_stream(self, entry_name: str, stream: BinaryIO, original_size: int, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_inefective_compression: bool = True):
         """Adds data from a readable binary stream."""
         if not hasattr(stream, "read"):
             raise TypeError("Stream object must have a 'read' method.")
 
-        def stream_iterator():
+        def provider():
             while True:
                 chunk = stream.read(CHUNK_SIZE)
                 if not chunk:
                     break
                 yield chunk
 
-        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, stream_iterator(), original_size, compress_algo, timestamp, metadata, password)
+        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, timestamp, metadata, password, allow_inefective_compression)
 
     def add_directory(self, entry_name: str, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None):
         """Adds an explicit directory entry."""
         timestamp = timestamp if timestamp is not None else time.time()
-        self._add_entry_internal(entry_name, ENTRY_TYPE_DIRECTORY, iter([]), 0, "none", timestamp, metadata, None)
+
+        def empty_provider():
+            yield b""
+
+        self._add_entry_internal(entry_name, ENTRY_TYPE_DIRECTORY, empty_provider, 0, "none", timestamp, metadata, None, None)
 
     def _extract_entry_internal(
         self,
@@ -1022,7 +1149,23 @@ class HyperspaceUnit:
 
         try:
             with open(temp_filename, "wb") as temp_f:
-                temp_f.write(struct.pack(HEADER_FORMAT, MAGIC_NUMBER, FORMAT_VERSION, 0, 0))  # Write placeholder
+                temp_f.write(
+                    struct.pack(
+                        HEADER_FORMAT,
+                        MAGIC_NUMBER,
+                        FORMAT_VERSION,
+                        0,  # Flags
+                        0,  # Metadata Offset
+                        0,  # Metadata Size,
+                        0,  # Index Offset,
+                        0,  # Index Size,
+                        0,  # Index CRC32,
+                    )
+                )
+
+                current_offset = HEADER_SIZE
+                new_index: Dict[str, Dict[str, Any]] = {}
+                new_archive_metadata = self._archive_metadata.copy()
 
                 active_entry_names = sorted([name for name, meta in self._index.items() if not meta.get("deleted", False)])
 
@@ -1057,19 +1200,51 @@ class HyperspaceUnit:
                     new_index[entry_name] = new_entry_info
                     current_offset += bytes_copied
 
-                # --- Write the new index ---
+                # --- Write the new archive metadata ---
+                temp_f.seek(current_offset)
+
+                metadata_offset = 0
+                metadata_size = 0
+                if new_archive_metadata:
+                    try:
+                        metadata_json = json.dumps(new_archive_metadata, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        compressed_metadata = zlib.compress(metadata_json, level=DEFAULT_COMPRESSION_LEVEL["zlib"])
+                        metadata_offset = temp_f.tell()
+                        metadata_size = len(compressed_metadata)
+                        temp_f.write(compressed_metadata)
+                    except Exception as e_meta:
+                        raise HyperspaceUnitError(f"Failed to serialize or compress the metadata block: {e_meta}") from e_meta
+                    except (IOError, OSError) as e_meta:
+                        raise HyperspaceUnitError(f"I/O error while writing metadata block: {e_meta}") from e_meta
+
                 index_pos = temp_f.tell()
-                if not new_index:
-                    index_size = 0
-                else:
-                    index_json = json.dumps(new_index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                    compressed_index = zlib.compress(index_json, level=DEFAULT_COMPRESSION_LEVEL["zlib"])
-                    index_size = len(compressed_index)
-                    temp_f.write(compressed_index)
+                index_size = 0
+                index_crc32 = 0
+                if new_index:
+                    try:
+                        index_json = json.dumps(new_index, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        compressed_index = zlib.compress(index_json, level=DEFAULT_COMPRESSION_LEVEL["zlib"])
+                        index_size = len(compressed_index)
+                        index_crc32 = zlib.crc32(compressed_index) & 0xFFFFFFFF
+                        temp_f.write(compressed_index)
+                    except Exception as e_index:
+                        raise HyperspaceUnitError(f"Failed to serialize or compress the index: {e_index}") from e_index
+                    except (IOError, OSError) as e_index:
+                        raise HyperspaceUnitError(f"I/O error while writing index: {e_index}") from e_index
 
                 # --- Write the final header ---
                 temp_f.seek(0)
-                final_header = struct.pack(HEADER_FORMAT, MAGIC_NUMBER, FORMAT_VERSION, index_pos, index_size)
+                final_header = struct.pack(
+                    HEADER_FORMAT,
+                    MAGIC_NUMBER,
+                    FORMAT_VERSION,
+                    0, # Flags
+                    metadata_offset,
+                    metadata_size,
+                    index_pos,
+                    index_size,
+                    index_crc32,
+                )
                 temp_f.write(final_header)
 
             # --- Replace original file ---
@@ -1108,13 +1283,56 @@ class HyperspaceUnit:
                     print(f"Warning: Could not reopen original file after failed compaction: {reopen_e}")
             raise HyperspaceUnitError(f"Compaction failed: {e}") from e
 
-    # --- Notes on Parallelism ---
-    # For adding/extracting multiple files concurrently, consider using
-    # concurrent.futures.ThreadPoolExecutor or ProcessPoolExecutor *outside*
-    # this class to manage tasks calling HyperspaceUnit methods.
-    # Ensure thread/process safety if multiple workers access the same
-    # HyperspaceUnit instance concurrently (locking might be needed, or
-    # process tasks independently).
+    def test_unit(self, password: Optional[str] = None) -> List[Tuple[str, str]]:
+        """
+        Tests the integrity of the archive by attempting to read and verify each entry.
+
+        Checks CRC32, original size, and decryption (if password provided).
+
+        Args:
+            password: The password for decryption, if entries are encrypted.
+
+        Returns:
+            A list of tuples `(entry_name, error_message)` for entries that failed verification.
+            Returns an empty list if all entries are okay.
+        """
+
+        if not self._file or self._file.closed:
+            try:
+                self.open("r")
+            except Exception as e:
+                raise HyperspaceUnitError(f"Unit must be open for reading. Failed to reopen: {e}") from e
+        if "r" not in self._open_mode and "+" not in self._open_mode:
+            raise HyperspaceUnitError("Unit must be open in a readable mode ('r' or 'r+') to test.")
+
+        print(f"Testing integrity of '{self.filename}'...")
+        failed_entries: List[Tuple[str, str]] = []
+        entries_to_test = self.list_entries()
+
+        for entry_name in entries_to_test:
+            print(f"   Testing: {entry_name}...", end="", flush=True)
+            try:
+                self._extract_entry_internal(
+                    entry_name=entry_name,
+                    target_iterator_func=lambda chunk: None,
+                    password=password,
+                )
+                print(" OK")
+            except (ChecksumError, DecryptionError, InvalidFormatError, EntryNotFoundError, HyperspaceUnitError) as e:
+                error_msg = f"{type(e).__name__}: {e}"
+                print(f" FAILED: {error_msg}")
+                failed_entries.append((entry_name, error_msg))
+            except Exception as e:
+                error_msg = f"Unexpected error: {type(e).__name__}: {e}"
+                print(f" FAILED: {error_msg}")
+                failed_entries.append((entry_name, error_msg))
+
+        if not failed_entries:
+            print("Integrity test passed for all entries.")
+        else:
+            print(f"Integrity test failed for {len(failed_entries)} entries.")
+
+        return failed_entries
 
 
 # --- Example Usage ---
@@ -1147,9 +1365,12 @@ if __name__ == "__main__":
         f.write("Log line\n" * 10000)  # ~100KB
 
     # 1. Create and add entries (with encryption, metadata, directories)
-    print(f'\n1. Creating "{UNIT_FILENAME}" with various features...')
     try:
         with HyperspaceUnit(UNIT_FILENAME).open("w") as unit:
+            # Add metadata
+            unit.set_archive_metadata({"creator": "DemoScript", "comment": "HSU (Hyperspace Unit) Test Archive", "created_utc": time.time()})
+            print("  - Set archive metadata.")
+
             # Add directory
             unit.add_directory("confidential/", metadata={"access_level": "admin"})
             print("  - Added directory confidential/")
@@ -1172,6 +1393,11 @@ if __name__ == "__main__":
                 )
             print("  - Added logs/large_app.log via stream (lzma compressed)")
 
+            small_data = b"abc"
+            unit.add_data("misc/small.txt", small_data, compress_algo="zlib", allow_ineffective_compression=True)
+            print(f"  - Added misc/small.txt (size {len(small_data)}) with zlib (ineffective allowed)")
+            # If allow_ineffective_compression=False, this would fail.
+
         print(f'"{UNIT_FILENAME}" created.')
     except Exception as e:
         print(f"Error during creation: {e}")
@@ -1181,6 +1407,11 @@ if __name__ == "__main__":
     print(f'\n2. Listing entries in "{UNIT_FILENAME}"...')
     try:
         with HyperspaceUnit(UNIT_FILENAME).open("r") as unit:
+            print("  Metadata:")
+            archive_metadata = unit.get_archive_metadata()
+            for k, v in archive_metadata.items():
+                print(f"    {k}: {v}")
+
             print("  All entries (including dirs):")
             for entry in unit.list_entries(include_dirs=True):
                 info = unit.get_entry_info(entry)
@@ -1210,7 +1441,25 @@ if __name__ == "__main__":
         print(f"Error during listing: {e}")
         raise
 
-    # 3. Extract entries
+    # 3. Test integrity of the archive
+    try:
+        with HyperspaceUnit(UNIT_FILENAME).open("r") as unit:
+            # Test without password (expecting decryption failure)
+            print("  Testing without password (expecting decryption failure):")
+            failures_no_pass = unit.test_unit()
+            # assert any("secret_report.txt" in f[0] for f in failures_no_pass)  # Check for failure
+
+            print("\n  Testing with correct password:")
+            failures_with_pass = unit.test_unit(password=DEMO_PASSWORD)  # Test with password
+            if not failures_with_pass:
+                print("  -> Test with password successful!")
+            else:
+                print(f"  -> Test with password FAILED for: {failures_with_pass}")
+
+    except Exception as e:
+        print(f"Error during testing: {e}")
+
+    # 4. Extract entries
     print(f'\n3. Extracting entries to "{EXTRACT_FOLDER}"...')
     try:
         with HyperspaceUnit(UNIT_FILENAME).open("r") as unit:
@@ -1244,7 +1493,7 @@ if __name__ == "__main__":
         print(f"Error during extraction: {e}")
         raise
 
-    # 4. Update an entry
+    # 5. Update an entry
     print("\n4. Updating 'assets/images/logo.png'...")
     try:
         # Create new dummy data for update
@@ -1275,7 +1524,7 @@ if __name__ == "__main__":
         print(f"Error during update: {e}")
         raise
 
-    # 5. Compact to remove deleted/old entries
+    # 6. Compact to remove deleted/old entries
     print(f'\n5. Compacting "{UNIT_FILENAME}"...')
     try:
         size_before = os.path.getsize(UNIT_FILENAME)
