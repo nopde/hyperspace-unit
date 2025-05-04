@@ -37,6 +37,7 @@ import struct
 import zlib
 import bz2
 import lzma
+import zstandard as zstd
 import io
 import time
 import secrets  # For generating salt and nonce
@@ -65,11 +66,12 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
 DEFAULT_COMPRESSION_ALGO = "zlib"
 DEFAULT_COMPRESSION_LEVEL = {
-    "zlib": 6,
+    "zlib": 9,
     "bz2": 9,
     "lzma": 6,  # Preset level
+    "zstd": 3,
 }
-SUPPORTED_COMPRESSION = ["none", "zlib", "bz2", "lzma"]
+SUPPORTED_COMPRESSION = ["none", "zlib", "bz2", "lzma", "zstd"]
 
 # Encryption Constants (Using AES-GCM for Authenticated Encryption)
 ENCRYPTION_ALGO = "aes-gcm-256"
@@ -566,6 +568,12 @@ class HyperspaceUnit:
             compressor = bz2.BZ2Compressor(DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
         elif actual_compress_algo == "lzma":
             compressor = lzma.LZMACompressor(format=lzma.FORMAT_XZ, preset=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+        elif actual_compress_algo == "zstd":
+            try:
+                zstd_cctx = zstd.ZstdCompressor(level=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+                compressor = zstd_cctx.compressobj()
+            except Exception as e:
+                raise HyperspaceUnitError(f"Failed to create Zstandard compressor: {e}") from e
 
         if password:
             if not CRYPTOGRAPHY_AVAILABLE:
@@ -599,7 +607,10 @@ class HyperspaceUnit:
                 crc_calculator = zlib.crc32(chunk, crc_calculator)
 
                 if compressor:
-                    compressed_chunk = compressor.compress(chunk)
+                    try:
+                        compressed_chunk = compressor.compress(chunk)
+                    except Exception as e_compress:
+                        raise HyperspaceUnitError(f"Failed to compress data: {e_compress}") from e_compress
                 else:
                     compressed_chunk = chunk
 
@@ -612,7 +623,11 @@ class HyperspaceUnit:
                     processed_data_buffer.write(encrypted_chunk)
 
             if compressor:
-                final_compressed_chunk = compressor.flush()
+                try:
+                    final_compressed_chunk = compressor.flush()
+                except Exception as e_compress:
+                    raise HyperspaceUnitError(f"Failed to flush compressor: {e_compress}") from e_compress
+
                 if final_compressed_chunk:
                     if encryptor:
                         encrypted_chunk = encryptor.update(final_compressed_chunk)
@@ -827,8 +842,13 @@ class HyperspaceUnit:
         elif compression == "bz2":
             decompressor = bz2.BZ2Decompressor()
         elif compression == "lzma":
-            # LZMA streaming requires careful handling, using LZMADecompressor
             decompressor = lzma.LZMADecompressor(format=lzma.FORMAT_XZ)
+        elif compression == "zstd":
+            try:
+                zstd_dctx = zstd.ZstdDecompressor()
+                decompressor = zstd_dctx.decompressobj()
+            except Exception as e:
+                raise HyperspaceUnitError(f"Failed to create Zstandard decompressor: {e}") from e
         elif compression != "none":
             raise InvalidFormatError(f"Unsupported compression method '{compression}' for entry '{entry_name}'.")
 
@@ -866,6 +886,8 @@ class HyperspaceUnit:
                         raise InvalidFormatError(f'Decompression failed (zlib) for "{entry_name}": {decomp_err}') from decomp_err
                     except lzma.LZMAError as decomp_err:
                         raise InvalidFormatError(f'Decompression failed (lzma) for "{entry_name}": {decomp_err}') from decomp_err
+                    except zstd.ZstdError as decomp_err:
+                        raise InvalidFormatError(f'Decompression failed (zstd) for "{entry_name}": {decomp_err}') from decomp_err
                     except (EOFError, ValueError) as decomp_err:  # Catch potential bz2 errors
                         if compression == "bz2":
                             raise InvalidFormatError(f'Decompression failed (bz2) for "{entry_name}": {decomp_err}') from decomp_err
@@ -895,6 +917,8 @@ class HyperspaceUnit:
                             raise InvalidFormatError(f'Decompression failed (zlib) during finalization for "{entry_name}": {decomp_err}') from decomp_err
                         except lzma.LZMAError as decomp_err:
                             raise InvalidFormatError(f'Decompression failed (lzma) during finalization for "{entry_name}": {decomp_err}') from decomp_err
+                        except zstd.ZstdError as decomp_err:
+                            raise InvalidFormatError(f'Decompression failed (zstd) during finalization for "{entry_name}": {decomp_err}') from decomp_err
                         except (EOFError, ValueError) as decomp_err:  # Catch potential bz2 errors
                             if compression == "bz2":
                                 raise InvalidFormatError(f'Decompression failed (bz2) during finalization for "{entry_name}": {decomp_err}') from decomp_err
@@ -1238,7 +1262,7 @@ class HyperspaceUnit:
                     HEADER_FORMAT,
                     MAGIC_NUMBER,
                     FORMAT_VERSION,
-                    0, # Flags
+                    0,  # Flags
                     metadata_offset,
                     metadata_size,
                     index_pos,
@@ -1360,9 +1384,11 @@ if __name__ == "__main__":
     with open("temp_files/docs/report.txt", "w") as f:
         f.write("Sensitive report data.")
     with open("temp_files/images/logo.png", "wb") as f:
-        f.write(os.urandom(5000))
+        f.write(os.urandom(5000))  # ~50KB
     with open("temp_files/large_log.log", "w") as f:
         f.write("Log line\n" * 10000)  # ~100KB
+    with open("temp_files/large_log.zst", "wb") as f:
+        f.write(os.urandom(5000))  # ~50KB
 
     # 1. Create and add entries (with encryption, metadata, directories)
     try:
@@ -1392,6 +1418,16 @@ if __name__ == "__main__":
                     compress_algo="lzma",  # Use lzma for potentially better compression
                 )
             print("  - Added logs/large_app.log via stream (lzma compressed)")
+
+            # Add file using Zstandard
+            with open("temp_files/large_log.zst", "rb") as zstd_stream:
+                unit.add_stream(
+                    "logs/large_app.zst",
+                    zstd_stream,
+                    os.path.getsize("temp_files/large_log.zst"),
+                    compress_algo="zstd",
+                )
+            print("  - Added logs/large_app.zst via stream (zstd compressed)")
 
             small_data = b"abc"
             unit.add_data("misc/small.txt", small_data, compress_algo="zlib", allow_ineffective_compression=True)
