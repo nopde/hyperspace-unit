@@ -64,11 +64,11 @@ FORMAT_VERSION = 1
 HEADER_FORMAT = ">8sHH4xQQQQI"
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
-DEFAULT_COMPRESSION_ALGO = "zlib"
+DEFAULT_COMPRESSION_ALGO = "zstd"
 DEFAULT_COMPRESSION_LEVEL = {
     "zlib": 9,
     "bz2": 9,
-    "lzma": 6,  # Preset level
+    "lzma": 6,
     "zstd": 3,
 }
 SUPPORTED_COMPRESSION = ["none", "zlib", "bz2", "lzma", "zstd"]
@@ -528,6 +528,7 @@ class HyperspaceUnit:
         data_provider: Callable[[], Iterator[bytes]],
         original_size: int,
         compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
+        compress_level: Optional[int] = DEFAULT_COMPRESSION_LEVEL[DEFAULT_COMPRESSION_ALGO],
         timestamp: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
         password: Optional[str] = None,
@@ -560,17 +561,18 @@ class HyperspaceUnit:
         nonce = None
         compressor = None
         actual_compress_algo = compress_algo if compress_algo is not None else "none"
+        actual_compress_level = compress_level if compress_level is not None else DEFAULT_COMPRESSION_LEVEL[actual_compress_algo]
         processed_data_buffer = io.BytesIO()
 
         if actual_compress_algo == "zlib":
-            compressor = zlib.compressobj(level=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+            compressor = zlib.compressobj(level=actual_compress_level)
         elif actual_compress_algo == "bz2":
-            compressor = bz2.BZ2Compressor(DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+            compressor = bz2.BZ2Compressor(actual_compress_level)
         elif actual_compress_algo == "lzma":
-            compressor = lzma.LZMACompressor(format=lzma.FORMAT_XZ, preset=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+            compressor = lzma.LZMACompressor(format=lzma.FORMAT_XZ, preset=actual_compress_level)
         elif actual_compress_algo == "zstd":
             try:
-                zstd_cctx = zstd.ZstdCompressor(level=DEFAULT_COMPRESSION_LEVEL[actual_compress_algo])
+                zstd_cctx = zstd.ZstdCompressor(level=actual_compress_level)
                 compressor = zstd_cctx.compressobj()
             except Exception as e:
                 raise HyperspaceUnitError(f"Failed to create Zstandard compressor: {e}") from e
@@ -722,7 +724,17 @@ class HyperspaceUnit:
 
         self._modified = True
 
-    def add_data(self, entry_name: str, data: bytes, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_ineffective_compression: bool = True):
+    def add_data(
+        self,
+        entry_name: str,
+        data: bytes,
+        compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
+        compress_level: Optional[int] = DEFAULT_COMPRESSION_LEVEL[DEFAULT_COMPRESSION_ALGO],
+        timestamp: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        password: Optional[str] = None,
+        allow_ineffective_compression: bool = True,
+    ):
         """Adds raw byte data as a file entry."""
         if not isinstance(data, bytes):
             raise TypeError("Data must be bytes.")
@@ -730,9 +742,18 @@ class HyperspaceUnit:
         def provider():
             yield data
 
-        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, len(data), compress_algo, timestamp, metadata, password, allow_ineffective_compression)
+        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, len(data), compress_algo, compress_level, timestamp, metadata, password, allow_ineffective_compression)
 
-    def add_file(self, file_path: str, entry_name: Optional[str] = None, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_ineffective_compression: bool = True):
+    def add_file(
+        self,
+        file_path: str,
+        entry_name: Optional[str] = None,
+        compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
+        compress_level: Optional[int] = DEFAULT_COMPRESSION_LEVEL[DEFAULT_COMPRESSION_ALGO],
+        metadata: Optional[Dict[str, Any]] = None,
+        password: Optional[str] = None,
+        allow_ineffective_compression: bool = True,
+    ):
         """Adds a file from the local filesystem."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f'Local file not found: "{file_path}"')
@@ -758,11 +779,22 @@ class HyperspaceUnit:
                 except (IOError, OSError) as e_prov:
                     raise HyperspaceUnitError(f'Failed to read local file "{file_path}": {e_prov}') from e_prov
 
-            self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, timestamp, metadata, password, allow_ineffective_compression)
+            self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, compress_level, timestamp, metadata, password, allow_ineffective_compression)
         except (IOError, OSError) as e:
             raise HyperspaceUnitError(f'Failed to read local file "{file_path}": {e}') from e
 
-    def add_stream(self, entry_name: str, stream: BinaryIO, original_size: int, compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None, password: Optional[str] = None, allow_inefective_compression: bool = True):
+    def add_stream(
+        self,
+        entry_name: str,
+        stream: BinaryIO,
+        original_size: int,
+        compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
+        compress_level: Optional[int] = DEFAULT_COMPRESSION_LEVEL[DEFAULT_COMPRESSION_ALGO],
+        timestamp: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        password: Optional[str] = None,
+        allow_inefective_compression: bool = True,
+    ):
         """Adds data from a readable binary stream."""
         if not hasattr(stream, "read"):
             raise TypeError("Stream object must have a 'read' method.")
@@ -774,7 +806,7 @@ class HyperspaceUnit:
                     break
                 yield chunk
 
-        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, timestamp, metadata, password, allow_inefective_compression)
+        self._add_entry_internal(entry_name, ENTRY_TYPE_FILE, provider, original_size, compress_algo, compress_level, timestamp, metadata, password, allow_inefective_compression)
 
     def add_directory(self, entry_name: str, timestamp: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None):
         """Adds an explicit directory entry."""
@@ -785,10 +817,111 @@ class HyperspaceUnit:
 
         self._add_entry_internal(entry_name, ENTRY_TYPE_DIRECTORY, empty_provider, 0, "none", timestamp, metadata, None, None)
 
+    def _normalize_archive_path(self, path: str) -> str:
+        """Converts OS separators to '/' and removes leading/trailing slashes."""
+        if not path:
+            return ""
+        return path.replace(os.sep, "/").strip("/")
+
+    def add_directory_recursive(
+        self,
+        source_path: str,
+        base_entry_path: Optional[str] = None,
+        compress_algo: Optional[str] = DEFAULT_COMPRESSION_ALGO,
+        compress_level: Optional[int] = DEFAULT_COMPRESSION_LEVEL[DEFAULT_COMPRESSION_ALGO],
+        password: Optional[str] = None,
+        allow_ineffective_compression: bool = True,
+        progress_callback: Optional[Callable[[str, bool], None]] = None,
+        skip_errors: bool = False,
+    ):
+        """Adds a directory and its contents recursively to the unit."""
+        if not self._file or self._file.closed or not self._file.writable():
+            raise HyperspaceUnitError('Unit must be open in a writable mode ("w", "a", "r+") to add recursively.')
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(f"Source directory not found: '{source_path}'")
+        if not os.path.isdir(source_path):
+            raise NotADirectoryError(f"Source path is not a directory: '{source_path}'")
+
+        source_path_abs = os.path.abspath(source_path)
+        if base_entry_path is None:
+            archive_root = self._normalize_archive_path(os.path.basename(source_path_abs))
+        elif base_entry_path == "":
+            archive_root = ""
+        else:
+            archive_root = self._normalize_archive_path(base_entry_path)
+
+        print(f"Adding directory '{source_path}' recursively under archive path '{archive_root or '/'}'...")
+
+        for dirpath, dirnames, filenames in os.walk(source_path_abs, topdown=True):
+            relative_dir = os.path.relpath(dirpath, source_path_abs)
+            archive_dir_part = self._normalize_archive_path(relative_dir) if relative_dir != "." else ""
+
+            current_archive_dir_path = archive_root
+            if archive_dir_part:
+                current_archive_dir_path = f"{archive_root}/{archive_dir_part}" if archive_root else archive_dir_part
+            current_archive_dir_path_normalized = self._normalize_archive_path(current_archive_dir_path)
+
+            dirs_to_process = list(dirnames)
+            for dirname in dirs_to_process:
+                local_subdir_path = os.path.join(dirpath, dirname)
+                archive_subdir_path = f"{current_archive_dir_path_normalized}/{dirname}" if current_archive_dir_path_normalized else dirname
+                archive_subdir_path_normalized = self._normalize_archive_path(archive_subdir_path)
+
+                try:
+                    timestamp = os.path.getmtime(local_subdir_path)
+                    self.add_directory(archive_subdir_path_normalized, timestamp=timestamp)
+                    if progress_callback:
+                        progress_callback(archive_subdir_path_normalized, True)  # True indicates directory
+                    print(f"  + Added dir:  {archive_subdir_path_normalized}")
+                except (OSError, HyperspaceUnitError) as e:
+                    error_msg = f"Failed to add directory '{archive_subdir_path_normalized}' (from '{local_subdir_path}'): {e}"
+                    if skip_errors:
+                        print(f"Warning: {error_msg}")
+                    else:
+                        raise HyperspaceUnitError(error_msg) from e
+                except Exception as e:
+                    error_msg = f"Unexpected error adding directory '{archive_subdir_path_normalized}': {e}"
+                    print(f"Error: {error_msg}")
+                    if not skip_errors:
+                        raise HyperspaceUnitError(error_msg) from e
+
+            for filename in filenames:
+                local_file_path = os.path.join(dirpath, filename)
+                archive_file_path = f"{current_archive_dir_path_normalized}/{filename}" if current_archive_dir_path_normalized else filename
+                archive_file_path_normalized = self._normalize_archive_path(archive_file_path)
+
+                try:
+                    print(f"  + Adding file: {archive_file_path_normalized} ...", end="")
+                    self.add_file(
+                        file_path=local_file_path,
+                        entry_name=archive_file_path_normalized,
+                        compress_algo=compress_algo,
+                        compress_level=compress_level,
+                        password=password,
+                        allow_ineffective_compression=allow_ineffective_compression,
+                    )
+                    print(" Done.")
+                    if progress_callback:
+                        progress_callback(archive_file_path_normalized, False)  # False indicates file
+                except (FileNotFoundError, ValueError, HyperspaceUnitError, OSError) as e:
+                    error_msg = f"Failed to add file '{archive_file_path_normalized}' (from '{local_file_path}'): {e}"
+                    print(f" Error ({type(e).__name__})")
+                    if not skip_errors:
+                        raise HyperspaceUnitError(error_msg) from e
+                    else:
+                        print(f"Warning: {error_msg}")
+                except Exception as e:
+                    error_msg = f"Unexpected error adding file '{archive_file_path_normalized}': {e}"
+                    print(f" Error ({type(e).__name__})")
+                    if not skip_errors:
+                        raise HyperspaceUnitError(error_msg) from e
+                    else:
+                        print(f"Warning: {error_msg}")
+
     def _extract_entry_internal(
         self,
         entry_name: str,
-        target_iterator_func,  # Function that accepts a chunk and processes it
+        target_iterator_func,
         password: Optional[str] = None,
     ):
         """Internal helper for extracting data (to bytes or stream)."""
